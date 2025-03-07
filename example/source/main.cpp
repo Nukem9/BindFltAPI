@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <format>
 #include "../../bindfltapi.h"
+#include "util.h"
 
 const std::wstring g_TestingRootPath = L"D:\\vfs-testing-root";
 
@@ -143,7 +144,7 @@ bool TestMergeMultipleDirectories(HANDLE JobHandle)
 	return true;
 }
 
-bool TestMapSourceToDest(HANDLE JobHandle)
+bool TestMapFileSourceToDest(HANDLE JobHandle)
 {
 	printf("Mapping virtual file for job 0x%p...\n\n", JobHandle);
 
@@ -167,94 +168,114 @@ bool TestMapSourceToDest(HANDLE JobHandle)
 	return true;
 }
 
-bool TestSpawnProcessInSiloWithRemapping(const wchar_t *ProcessPath)
+bool TestSpawnProcessInSiloWithFileRemapping(const wchar_t *ProcessPath)
 {
-	printf("Spawning process with virtualized filesystem...\n\n");
-
-	// In order to create a temporary bindflt mapping we need to create an application silo. In order to
-	// create an application silo we need to create a job object with the appropriate flags. Then we spawn
-	// processes within said job object.
-	//
-	// Note these application silos aren't equivalent to full Windows Server silos. They're traditionally
-	// used for UWP isolation on client SKUs.
-	auto jobObject = CreateJobObjectW(nullptr, nullptr);
-
-	if (!jobObject)
-	{
-		printf("CreateJobObjectW failed: %u\n", GetLastError());
-		return false;
-	}
-
-	JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = {};
-	jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-	SetInformationJobObject(jobObject, JobObjectExtendedLimitInformation, &jobInfo, sizeof(jobInfo));
-	SetInformationJobObject(jobObject, JobObjectCreateSilo, nullptr, 0);
-
-	// Processes must be created with a job object (silo) attached. Assigning them to jobs after the fact
-	// won't work.
-	size_t listSize = 0;
-	InitializeProcThreadAttributeList(nullptr, 1, 0, &listSize);
-
-	auto attributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(_alloca(listSize));
-	if (!InitializeProcThreadAttributeList(attributeList, 1, 0, &listSize))
-	{
-		printf("InitializeProcThreadAttributeList failed: %u\n", GetLastError());
-		return false;
-	}
-
-	if (!UpdateProcThreadAttribute(attributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobObject, sizeof(jobObject), nullptr, nullptr))
-	{
-		printf("UpdateProcThreadAttribute failed: %u\n", GetLastError());
-		return false;
-	}
-
-	// Finally remap directories and create the process
-	TestMapSourceToDest(jobObject);
-	TestDumpMappings(jobObject);
-
-	PROCESS_INFORMATION processInfo = {};
-	STARTUPINFOEXW startupInfoEx = {};
-	startupInfoEx.lpAttributeList = attributeList;
-	startupInfoEx.StartupInfo.cb = sizeof(startupInfoEx);
-
-	const bool processCreated = CreateProcessW(
+	return SpawnProcess(
 		ProcessPath,
-		nullptr,
-		nullptr,
-		nullptr,
-		false,
-		EXTENDED_STARTUPINFO_PRESENT,
-		nullptr,
-		nullptr,
-		&startupInfoEx.StartupInfo,
-		&processInfo);
+		[](HANDLE JobObject)
+		{
+			TestMapFileSourceToDest(JobObject);
+			TestDumpMappings(JobObject);
+		},
+		nullptr);
+}
 
-	if (processCreated)
-	{
-		WaitForSingleObject(processInfo.hProcess, INFINITE);
-		CloseHandle(processInfo.hThread);
-		CloseHandle(processInfo.hProcess);
-	}
-	else
-	{
-		printf("CreateProcessW failed: %u\n", GetLastError());
-	}
+bool TestSpawnProcessInSiloWithSystemLibraryRemapping(const wchar_t *ProcessPath)
+{
+	return SpawnProcess(
+		ProcessPath,
+		[](HANDLE JobObject)
+		{
+			printf("Mapping virtual file for job 0x%p...\n\n", JobObject);
+			CopyFileW(L"C:\\Windows\\System32\\KernelBase.dll", std::format(L"{}\\KernelBase_copy.dll", g_TestingRootPath).c_str(), false);
+			CopyFileW(L"C:\\Windows\\System32\\kernel32.dll", std::format(L"{}\\kernel32_copy.dll", g_TestingRootPath).c_str(), false);
 
-	DeleteProcThreadAttributeList(attributeList);
-	CloseHandle(jobObject);
+			auto physPath = std::format(L"{}\\kernel32_copy.dll", g_TestingRootPath);
+			auto virtPath = std::format(L"C:\\Windows\\System32\\kernel32.dll");
 
-	return processCreated;
+			auto hr = PfnBfRemoveMapping(JobObject, virtPath.c_str());
+			hr = PfnBfSetupFilter(
+				JobObject,
+				BINDFLT_FLAG_USE_CURRENT_SILO_MAPPING | BINDFLT_FLAG_PREVENT_CASE_SENSITIVE_BINDING,
+				virtPath.c_str(),
+				physPath.c_str(),
+				nullptr,
+				0);
+
+			physPath = std::format(L"{}\\KernelBase_copy.dll", g_TestingRootPath);
+			virtPath = std::format(L"C:\\Windows\\System32\\KernelBase.dll");
+
+			hr = PfnBfRemoveMapping(JobObject, virtPath.c_str());
+			hr = PfnBfSetupFilter(
+				JobObject,
+				BINDFLT_FLAG_USE_CURRENT_SILO_MAPPING | BINDFLT_FLAG_PREVENT_CASE_SENSITIVE_BINDING,
+				virtPath.c_str(),
+				physPath.c_str(),
+				nullptr,
+				0);
+
+			if (FAILED(hr))
+			{
+				printf("BfSetupFilter failed: 0x%X\n", hr);
+				__debugbreak();
+			}
+
+			TestDumpMappings(JobObject);
+		},
+		[](HANDLE JobObject, HANDLE Process)
+		{
+			using PfnNtQueryInformationProcess = LONG(WINAPI *)(HANDLE, UINT, PVOID, ULONG, PULONG);
+
+			typedef struct _PROCESS_BASIC_INFORMATION
+			{
+				LONG ExitStatus;
+				struct PEB *PebBaseAddress;
+				KAFFINITY AffinityMask;
+				UINT BasePriority;
+				HANDLE UniqueProcessId;
+				HANDLE InheritedFromUniqueProcessId;
+			} PROCESS_BASIC_INFORMATION, *PPROCESS_BASIC_INFORMATION;
+
+			PROCESS_BASIC_INFORMATION pbi = {};
+
+			auto ntdllHandle = GetModuleHandleW(L"ntdll.dll");
+			auto ntQIP = reinterpret_cast<PfnNtQueryInformationProcess>(GetProcAddress(ntdllHandle, "NtQueryInformationProcess"));
+
+			// !!! Set PEB->IsProtectedProcess to 1 to prevent KnownDLLs section mapping from being used. Otherwise ntdll never
+			// !!! queries the filesystem for the DLL and we can't remap it.
+			if (ntQIP(Process, 0, &pbi, sizeof(pbi), nullptr) == 0)
+			{
+				printf("Process PEB: 0x%p\n", pbi.PebBaseAddress);
+
+				const uintptr_t pebFlagsAddress = reinterpret_cast<uintptr_t>(pbi.PebBaseAddress) + 0x3;
+				const bool status = WriteProcessMemory(Process, reinterpret_cast<void *>(pebFlagsAddress), "\x02", 1, nullptr);
+
+				printf("Enable PEB->IsProtectedProcess: %s\n", status ? "Succeeded" : "Failed");
+			}
+
+			printf("\n");
+		});
 }
 
 int main(int argc, char **argv)
 {
 	TestLoadImports();
+	printf("Using scratch directory: %S\n", g_TestingRootPath.c_str());
 
-	// TestMapSourceToDest(nullptr);
-	TestMergeMultipleDirectories(nullptr);
-	TestDumpMappings(nullptr);
+	// Globally remap one file to another
+	//TestMapFileSourceToDest(nullptr);
 
-	TestSpawnProcessInSiloWithRemapping(L"C:\\Windows\\System32\\cmd.exe");
+	// Globally remap and merge multiple directories to other virtual directories
+	//TestMergeMultipleDirectories(nullptr);
+
+	// Globally list mappings
+	//TestDumpMappings(nullptr);
+
+	// Per-process remap one file to another and list mappings
+	//TestSpawnProcessInSiloWithFileRemapping(L"C:\\Windows\\System32\\cmd.exe");
+
+	// Per-process remap system library (kernel32.dll, kernelbase.dll) and list mappings
+	TestSpawnProcessInSiloWithSystemLibraryRemapping(L"C:\\Windows\\System32\\cmd.exe");
 
 	printf("Done\n");
 	return 0;

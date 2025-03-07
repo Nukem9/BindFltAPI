@@ -2,15 +2,6 @@
   "version": 6,
   "configurePresets": [
     {
-      "name": "config-base-vcpkg",
-      "hidden": true,
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-      "cacheVariables": {
-        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
-        "VCPKG_HOST_TRIPLET": "x64-windows-static"
-      }
-    },
-    {
       "name": "config-base-cmake",
       "hidden": true,
       "binaryDir": "${sourceDir}/bin/${presetName}",
@@ -47,7 +38,6 @@
       "name": "configuration-final",
       "hidden": true,
       "inherits": [
-        "config-base-vcpkg",
         "config-base-cmake",
         "config-base-ninja"
       ]
